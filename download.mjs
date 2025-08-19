@@ -17,9 +17,10 @@
 
 import fs from 'fs';
 import path from 'path';
-import { Transform, Readable } from 'stream';
-import { pipeline } from 'stream/promises';
-import { setTimeout as sleep } from 'timers/promises';
+import {Readable, Transform} from 'stream';
+import {pipeline} from 'stream/promises';
+import {setTimeout as sleep} from 'timers/promises';
+import https from 'https';
 
 // ===============
 // Console styling (ANSI colors) and emojis
@@ -413,8 +414,6 @@ async function obtainCsrfToken() {
     }
     return csrf;
 }
-
-import https from 'https';
 
 // Manual minimal cookie store (in-memory) for login flow only
 class SimpleCookieStore {
