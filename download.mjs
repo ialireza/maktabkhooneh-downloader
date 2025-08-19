@@ -865,23 +865,94 @@ async function downloadToFile(url, filePath, referer, maxRetries = 3, sampleByte
     }
 }
 
+async function collectAllDownloadLinks(courseSlug, normalizedCourseUrl, chapters, sampleBytesToDownload) {
+    const allLinks = [];
+
+    for (const chapter of chapters) {
+        const units = Array.isArray(chapter.unit_set) ? chapter.unit_set : [];
+
+        for (const unit of units) {
+            if (!unit?.status || unit?.type !== 'lecture') continue;
+            if (unit.locked) continue;
+
+            const lectureUrl = buildLectureUrl(courseSlug, chapter, unit);
+            try {
+                const res = await fetchWithTimeout(lectureUrl, {
+                    headers: {...commonHeaders(normalizedCourseUrl), accept: 'text/html'}
+                });
+                if (!res.ok) continue;
+
+                const html = await res.text();
+
+                // جمع‌آوری لینک‌های ویدیو
+                const videoSources = extractVideoSources(html);
+                const bestSourceUrl = pickBestSource(videoSources);
+                if (bestSourceUrl) {
+                    allLinks.push(bestSourceUrl);
+                }
+
+                // جمع‌آوری لینک‌های زیرنویس
+                const subtitleLinks = extractSubtitleLinks(html);
+                for (const sUrl of subtitleLinks) {
+                    try {
+                        const absUrl = new URL(sUrl, ORIGIN).toString();
+                        allLinks.push(absUrl);
+                    } catch {
+                    }
+                }
+
+                // جمع‌آوری لینک‌های ضمیمه
+                const attachmentLinks = extractAttachmentLinks(html);
+                for (const attUrl of attachmentLinks) {
+                    try {
+                        const absUrl = new URL(attUrl, ORIGIN).toString();
+                        allLinks.push(absUrl);
+                    } catch {
+                    }
+                }
+
+            } catch (err) {
+                logWarn(`Error collecting links for ${unit.title}: ${err.message}`);
+            }
+        }
+    }
+
+    return allLinks;
+}
+
+
+// اصلاح تابع main
 async function main() {
-    const { inputCourseUrl, sampleBytesToDownload, isVerboseLoggingEnabled, userEmail, userPassword, sessionFile, forceLogin } = parseCLI();
-    const { verbose } = createVerboseLogger(isVerboseLoggingEnabled);
-    if (!inputCourseUrl) { printUsage(); process.exit(1); }
-    // Attempt to load / create / verify session (may already return core)
-    const prep = await prepareSession({ userEmail, userPassword, sessionFile, verbose, courseUrl: inputCourseUrl, forceLogin });
+    const {
+        inputCourseUrl,
+        sampleBytesToDownload,
+        isVerboseLoggingEnabled,
+        userEmail,
+        userPassword,
+        sessionFile,
+        forceLogin
+    } = parseCLI();
+    const {verbose} = createVerboseLogger(isVerboseLoggingEnabled);
+    if (!inputCourseUrl) {
+        printUsage();
+        process.exit(1);
+    }
+
+    // آماده‌سازی session (مشابه قبل)
+    const prep = await prepareSession({
+        userEmail,
+        userPassword,
+        sessionFile,
+        verbose,
+        courseUrl: inputCourseUrl,
+        forceLogin
+    });
     ensureCookiePresent();
 
     const normalizedCourseUrl = ensureTrailingSlash(inputCourseUrl.trim());
     const courseSlug = extractCourseSlug(normalizedCourseUrl);
-    // Use decoded slug (human-friendly, especially for Persian) for the top-level folder name
-    const courseDisplayName = sanitizeName(decodeURIComponent(courseSlug));
-    const outputRootFolder = path.resolve(process.cwd(), 'download', courseDisplayName);
-    // Ensure base output folder exists
-    try { await fs.promises.mkdir(outputRootFolder, { recursive: true }); } catch { }
 
-    // Verify auth profile (reuse from prepareSession if available)
+    // بررسی احراز هویت (مشابه قبل)
     let coreData = prep.core;
     if (!coreData) {
         try {
@@ -891,145 +962,42 @@ async function main() {
             process.exit(1);
         }
     }
-    const ok = printProfileSummary(coreData);
-    if (!ok) { logError('Not logged in. Session invalid. Provide credentials with --user --pass.'); process.exit(1); }
 
-    console.log(`📚 Course slug: ${paintBold(decodeURIComponent(courseSlug))}`);
-    console.log(`📁 Output folder: ${paintCyan(outputRootFolder)}`);
-    if (sampleBytesToDownload && sampleBytesToDownload > 0) {
-        console.log(`🎯 Sample mode: downloading first ${paintBold(String(sampleBytesToDownload))} bytes of each video (saved as .sample.mp4)`);
+    if (!printProfileSummary(coreData)) {
+        logError('Not logged in. Session invalid. Provide credentials with --user --pass.');
+        process.exit(1);
     }
 
-    // Fetch chapters
+    // دریافت لیست فصل‌ها
     verbose(paintCyan('Fetching chapters...'));
     const chaptersData = await fetchChapters(courseSlug, normalizedCourseUrl);
     const chapters = Array.isArray(chaptersData?.chapters) ? chaptersData.chapters : [];
-    if (chapters.length === 0) { logError('No chapters found. Make sure the URL and cookie are correct.'); process.exit(2); }
+    if (chapters.length === 0) {
+        logError('No chapters found. Make sure the URL and cookie are correct.');
+        process.exit(2);
+    }
 
-    // Iterate chapters and units
-    let totalUnits = 0, downloadedCount = 0, skippedCount = 0, failedCount = 0;
+    // جمع‌آوری تمام لینک‌های دانلود
+    logStep('Collecting all download links...');
+    const downloadLinks = await collectAllDownloadLinks(courseSlug, normalizedCourseUrl, chapters, sampleBytesToDownload);
+
+    if (downloadLinks.length === 0) {
+        logError('No download links found!');
+        process.exit(3);
+    }
+
+    // ذخیره لینک‌ها در فایل
+    const linksFilePath = path.resolve(process.cwd(), 'idm_links.txt');
     try {
-        for (let chapterIndex = 0; chapterIndex < chapters.length; chapterIndex++) {
-            const chapter = chapters[chapterIndex];
-            const chapterOrder = String(chapterIndex + 1).padStart(2, '0');
-            const chapterFolder = path.join(outputRootFolder, `${chapterOrder} - ${sanitizeName(chapter.title || chapter.slug || 'chapter')}`);
-            console.log(`📖 Chapter ${chapterIndex + 1}/${chapters.length}: ${paintBold(chapter.title || chapter.slug)}`);
-
-            const units = Array.isArray(chapter.unit_set) ? chapter.unit_set : [];
-            for (let unitIndex = 0; unitIndex < units.length; unitIndex++) {
-                const unit = units[unitIndex];
-                if (!unit?.status) continue; // inactive
-                if (unit?.type !== 'lecture') continue; // skip non-video units
-                totalUnits++;
-                const unitOrder = String(unitIndex + 1).padStart(2, '0');
-                const baseFileName = `${unitOrder} - ${sanitizeName(unit.title || unit.slug || 'lecture')}.mp4`;
-                const finalFileName = (sampleBytesToDownload && sampleBytesToDownload > 0)
-                    ? baseFileName.replace(/\.mp4$/i, '.sample.mp4')
-                    : baseFileName;
-                const outputFilePath = path.join(chapterFolder, finalFileName);
-                verbose(`  🎬 Unit ${unitIndex + 1}/${units.length}: ${unit.title || unit.slug}`);
-
-                // Skip locked content or content requiring purchase
-                if (unit.locked) {
-                    logWarn(`🔒 Locked/No access: ${finalFileName}`);
-                    skippedCount++;
-                    continue;
-                }
-
-                const lectureUrl = buildLectureUrl(courseSlug, chapter, unit);
-                try {
-                    // Fetch lecture page HTML
-                    const res = await fetchWithTimeout(lectureUrl, { headers: { ...commonHeaders(normalizedCourseUrl), accept: 'text/html' } });
-                    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-                    const html = await res.text();
-                    const videoSources = extractVideoSources(html);
-                    const bestSourceUrl = pickBestSource(videoSources);
-                    if (!bestSourceUrl) { logWarn(`No video source found for: ${finalFileName}`); skippedCount++; continue; }
-
-
-                    // Print the filename on its own line; progress bar will render on the next line
-                    console.log(`📥 Downloading: ${finalFileName}`);
-                    const status = await downloadToFile(bestSourceUrl, outputFilePath, lectureUrl, 3, sampleBytesToDownload, '');
-                    if (status === 'exists') { console.log(paintYellow(`🟡 SKIP exists: ${finalFileName}`)); skippedCount++; }
-                    else { logSuccess(`DOWNLOADED: ${finalFileName}`); downloadedCount++; }
-
-                    // ---- Subtitles (download beside video, same base name) ----
-                    try {
-                        const subtitleLinks = extractSubtitleLinks(html);
-                        if (subtitleLinks.length > 0) {
-                            const videoBaseNoExt = finalFileName.replace(/\.sample\.mp4$/i, '').replace(/\.mp4$/i, '');
-                            for (const sUrl of subtitleLinks) {
-                                try {
-                                    const absUrl = (() => { try { return new URL(sUrl, ORIGIN).toString(); } catch { return sUrl; } })();
-                                    // determine extension from pathname or fallback to .vtt
-                                    let ext = '.vtt';
-                                    try { const up = new URL(absUrl); ext = path.extname(up.pathname) || '.vtt'; } catch { }
-                                    const subtitleName = `${videoBaseNoExt}${ext}`;
-                                    const subtitlePath = path.join(chapterFolder, subtitleName);
-                                    if (fs.existsSync(subtitlePath) && fs.statSync(subtitlePath).size > 0) {
-                                        console.log(paintYellow(`🟡 Subtitle exists: ${subtitleName}`));
-                                        continue;
-                                    }
-                                    console.log(`📝 Subtitle: ${subtitleName}`);
-                                    const sStatus = await downloadToFile(absUrl, subtitlePath, lectureUrl, 3, 0, '');
-                                    if (sStatus === 'exists') console.log(paintYellow(`🟡 Subtitle exists: ${subtitleName}`));
-                                    else logSuccess(`SUBTITLE: ${subtitleName}`);
-                                    await sleep(150);
-                                } catch (subErr) { logWarn(`Subtitle fail: ${subErr.message}`); }
-                            }
-                        }
-                    } catch (subOuter) { logWarn(`Subtitle parse error: ${subOuter.message}`); }
-
-                    // ---- Attachments (download beside video) ----
-                    try {
-                        const attachmentLinks = extractAttachmentLinks(html);
-                        if (attachmentLinks.length > 0) {
-                            // Derive base (remove .sample.mp4 or .mp4)
-                            const videoBaseNoExt = finalFileName.replace(/\.sample\.mp4$/i, '').replace(/\.mp4$/i, '');
-                            for (const attUrl of attachmentLinks) {
-                                try {
-                                    // Extract original filename from URL path (strip query)
-                                    let filePart;
-                                    try {
-                                        const u = new URL(attUrl);
-                                        filePart = u.pathname.split('/').pop() || 'attachment.bin';
-                                    } catch { filePart = attUrl.split('?')[0].split('/').pop() || 'attachment.bin'; }
-                                    // Keep original name (with underscores) but sanitize forbidden characters
-                                    const sanitizedAttachment = sanitizeName(filePart);
-                                    const finalAttachmentName = `${videoBaseNoExt} - ${sanitizedAttachment}`;
-                                    const attachmentPath = path.join(chapterFolder, finalAttachmentName);
-                                    if (fs.existsSync(attachmentPath) && fs.statSync(attachmentPath).size > 0) {
-                                        console.log(paintYellow(`🟡 Attachment exists: ${finalAttachmentName}`));
-                                        continue;
-                                    }
-                                    console.log(`📎 Attachment: ${finalAttachmentName}`);
-                                    const aStatus = await downloadToFile(attUrl, attachmentPath, lectureUrl, 3, 0, '');
-                                    if (aStatus === 'exists') console.log(paintYellow(`🟡 Attachment exists: ${finalAttachmentName}`));
-                                    else logSuccess(`ATTACHMENT: ${finalAttachmentName}`);
-                                    await sleep(200);
-                                } catch (attErr) {
-                                    logWarn(`Attachment fail: ${attErr.message}`);
-                                }
-                            }
-                        }
-                    } catch (attOuterErr) {
-                        logWarn(`Attachment parse error: ${attOuterErr.message}`);
-                    }
-                    // polite pause
-                    await sleep(400);
-                } catch (err) {
-                    logError(`FAIL ${finalFileName}: ${err.message}`);
-                    failedCount++;
-                }
-            }
-        }
-    } finally {
-        console.log('—'.repeat(40));
-        console.log(`📊 Total lecture units: ${paintBold(String(totalUnits))}`);
-        console.log(`✅ Downloaded: ${paintGreen(String(downloadedCount))}`);
-        console.log(`🟡 Skipped: ${paintYellow(String(skippedCount))}`);
-        console.log(`❌ Failed: ${paintRed(String(failedCount))}`);
+        await fs.promises.writeFile(linksFilePath, downloadLinks.join('\n'), 'utf8');
+        logSuccess(`All download links saved to: ${paintCyan(linksFilePath)}`);
+        console.log(paintGreen('You can now import this file into IDM:'));
+        console.log(paintYellow('1. Open IDM'));
+        console.log(paintYellow('2. Click "File" → "Import" → "Import List of URLs"'));
+        console.log(paintYellow(`3. Select the file: ${linksFilePath}`));
+    } catch (err) {
+        logError('Failed to save links file:', err.message);
+        process.exit(4);
     }
 }
-
 main().catch(err => { logError('Fatal:', err); process.exit(1); });
